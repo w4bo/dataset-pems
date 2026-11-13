@@ -11,6 +11,8 @@ Examples:
     python3 downloadPems.py --type chp_incidents_month --district all --years 2024-2026
     # 5-minute station data of District 3, July-September 2026 only
     python3 downloadPems.py --type station_5min --district 3 --years 2026 --months 7-9
+    # download again the files on disk that are broken (truncated, empty), here the 5-minute data of 2026
+    python3 downloadPems.py --type station_5min --district 3 --years 2026 --verify
     # only list what would be downloaded
     python3 downloadPems.py --type meta --district 3 --years 2026 --dry-run
 
@@ -21,6 +23,7 @@ Only the Python standard library is used.
 """
 import argparse
 import calendar
+import gzip
 import http.cookiejar
 import json
 import os
@@ -93,8 +96,9 @@ def file_name(entry):
     return qs.get("download", [entry["url"].rsplit("/", 1)[-1]])[0]
 
 
-def complete(path):
-    """False for a missing, empty or unreadable file (e.g. a download cut short), which is then downloaded again."""
+def complete(path, verify=False):
+    """False for a missing, empty or unreadable file (e.g. a download cut short), which is then downloaded again.
+    A .gz is only checked for its header unless [verify]: a truncated .gz is found only by decompressing it whole."""
     try:
         if path.stat().st_size == 0:
             return False
@@ -102,10 +106,14 @@ def complete(path):
             with zipfile.ZipFile(path) as z:
                 return z.testzip() is None
         if path.suffix == ".gz":
-            with open(path, "rb") as f:
-                return f.read(2) == b"\x1f\x8b"
+            with gzip.open(path, "rb") as f:
+                if not verify:
+                    return f.read(1) is not None
+                while f.read(1 << 24):
+                    pass
+            return True
         return True
-    except (OSError, zipfile.BadZipFile):
+    except (OSError, EOFError, zipfile.BadZipFile):
         return False
 
 
@@ -146,6 +154,9 @@ def main():
     p.add_argument("--workers", type=int, default=1,
                    help="parallel downloads (default: 1; the Clearinghouse asks for one at a time: keep it low, e.g. 2-3)")
     p.add_argument("--dry-run", action="store_true", help="only list the files")
+    p.add_argument("--verify", action="store_true",
+                   help="fully test the files already on disk (slow: decompresses them) and download again the "
+                        "broken ones, e.g. a .gz cut short")
     p.add_argument("--debug", action="store_true", help="print the raw Clearinghouse listings")
     a = p.parse_args()
 
@@ -166,7 +177,7 @@ def main():
             print(f"type={a.type} district={district} year={year}: {len(files)} files", flush=True)
             for e in files:
                 dest = a.out / file_name(e)
-                if complete(dest):
+                if complete(dest, a.verify):
                     n_skip += 1
                 elif a.dry_run:
                     print(f"  {dest.name}")
