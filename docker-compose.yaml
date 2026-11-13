@@ -1,0 +1,104 @@
+# PostgreSQL for the PeMS data: raw files in schema pems_original (loadPems.py), cleaned model in pems_cleaned
+# (etlPems.py). Schema: SCHEMA.md.
+#
+#   docker compose up -d pems-postgres                       # start the database (localhost:5435, postgres/password, db pems)
+#   docker compose run --rm pems-loader --from 2026-08-01    # load ./data from August 2026 on into pems_original
+#   docker compose run --rm pems-etl                         # (re)build pems_cleaned from pems_original
+#
+# A remote server instead of the local one (--no-deps: do not start pems-postgres):
+#   docker compose run --rm --no-deps -e PEMS_DSN="postgresql://user:pwd@host:5432/pems?sslmode=require" pems-loader --from 2026-08-01
+#   docker compose run --rm --no-deps -e PEMS_DSN="postgresql://user:pwd@host:5432/pems?sslmode=require" pems-etl
+#
+# Or from the host (PEMS_DSN or --dsn select the server; default: the local one):  pip install "psycopg[binary]";  python loadPems.py --from 2026-08-01;  python etlPems.py
+# Data lives in the named volume pems-pgdata (docker compose down -v deletes it).
+
+services:
+  pems-postgres:
+    image: postgres:17
+    container_name: pems-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pems
+    ports:
+      - "5435:5432"
+    volumes:
+      - pems-pgdata:/var/lib/postgresql/data
+    shm_size: 1g
+    # tuned for bulk loading (COPY into unindexed tables, indexes built afterwards) and analytical queries;
+    # wal_level=minimal: no replication, so bulk loads and index builds write (almost) no WAL
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - work_mem=64MB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - wal_compression=on
+      - -c
+      - synchronous_commit=off
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - max_parallel_maintenance_workers=4
+      - -c
+      - wal_level=minimal
+      - -c
+      - max_wal_senders=0
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pems"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  pems-loader:
+    image: python:3.12-slim
+    profiles: ["tools"]   # not started by "docker compose up"; use "docker compose run --rm pems-loader [args]"
+    depends_on:
+      pems-postgres:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      PEMS_DSN: postgresql://postgres:password@pems-postgres:5432/pems   # override with -e PEMS_DSN=... for a remote server
+    volumes:
+      - ./loadPems.py:/app/loadPems.py:ro
+      - ./data:/data:ro
+      - pems-pip-cache:/root/.cache/pip
+    entrypoint:
+      - sh
+      - -c
+      - pip install -q --root-user-action=ignore "psycopg[binary]" && exec python -u loadPems.py --dir /data "$$@"
+      - loadPems
+    command: []   # extra args of "docker compose run" are passed to loadPems.py
+
+  pems-etl:
+    image: python:3.12-slim
+    profiles: ["tools"]   # "docker compose run --rm pems-etl [args]"
+    depends_on:
+      pems-postgres:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      PEMS_DSN: postgresql://postgres:password@pems-postgres:5432/pems   # override with -e PEMS_DSN=... for a remote server
+    volumes:
+      - ./etlPems.py:/app/etlPems.py:ro
+      - pems-pip-cache:/root/.cache/pip
+    entrypoint:
+      - sh
+      - -c
+      - pip install -q --root-user-action=ignore "psycopg[binary]" && exec python -u etlPems.py "$$@"
+      - etlPems
+    command: []   # extra args of "docker compose run" are passed to etlPems.py
+
+volumes:
+  pems-pgdata:
+  pems-pip-cache:

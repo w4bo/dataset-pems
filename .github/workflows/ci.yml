@@ -1,0 +1,65 @@
+# Loads the small test files of tests/data into PostgreSQL (loadPems.py -> pems_original), builds pems_cleaned
+# (etlPems.py), checks the result (tests/check_db.py) and publishes a dump of the database in the PostgreSQL custom
+# (binary) format as the artifact "pems-dump" (restore: pg_restore -d <database> pems.dump).
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: pems
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pems"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PEMS_DSN: postgresql://postgres:password@localhost:5432/pems
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install psycopg
+        run: pip install "psycopg[binary]"
+
+      - name: Load the raw files into pems_original
+        run: python loadPems.py --dir tests/data --workers 2
+
+      - name: Load again (every file is already loaded, nothing to do)
+        run: |
+          python loadPems.py --dir tests/data | tee rerun.log
+          grep -q "^0 files to load" rerun.log
+
+      - name: Build pems_cleaned
+        run: python etlPems.py
+
+      - name: Check the database
+        run: python tests/check_db.py
+
+      # pg_dump of the same major version as the server (the runner's client may be older)
+      - name: Dump the database (custom binary format)
+        run: |
+          docker run --rm --network host -v "$PWD:/out" postgres:17 \
+            pg_dump "$PEMS_DSN" --format=custom --compress=9 --no-owner --file=/out/pems.dump
+          docker run --rm -v "$PWD:/out" postgres:17 pg_restore --list /out/pems.dump | grep -c "TABLE DATA"
+          ls -l pems.dump
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pems-dump
+          path: pems.dump
+          retention-days: 14
